@@ -1,0 +1,747 @@
+/*
+ * じぶん銀行スマホクイック口座開設アプリ
+ * Copyright (c) 2012 TIS Inc. All rights reserved.
+ */
+
+package jp.co.jibunbank.jibunquick.activity;
+
+import java.io.IOException;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.util.Map;
+
+import jp.co.jibunbank.jibunquick.R;
+import jp.co.jibunbank.jibunquick.application.Fields;
+import jp.co.jibunbank.jibunquick.application.JibunRepository;
+import jp.co.jibunbank.jibunquick.util.CameraUtils;
+import jp.co.tis.dokodemo.ocr.Jpeg;
+import jp.co.tis.dokodemo.ocr.LicenseDataEditTask;
+import jp.co.tis.dokodemo.ocr.LicenseOcrTask;
+import jp.co.tis.dokodemo.ocr.LicenseRecognitionTask;
+import jp.co.tis.dokodemo.ocr.OcrApiResult;
+import jp.co.tis.dokodemo.ocr.OcrException;
+import jp.co.tis.dokodemo.ocr.OcrField;
+import jp.co.tis.dokodemo.ocr.RecognitionData;
+import jp.co.tis.dokodemo.utils.LogUtils;
+import jp.co.tis.dokodemo.utils.MemoryUtils;
+import android.app.Activity;
+import android.app.AlertDialog;
+import android.app.Dialog;
+import android.content.DialogInterface;
+import android.content.Intent;
+import android.content.res.Configuration;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.Color;
+import android.hardware.Camera;
+import android.os.Bundle;
+import android.support.v4.app.DialogFragment;
+import android.util.Log;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
+import android.view.View;
+import android.view.WindowManager;
+import android.widget.ImageView;
+import android.widget.ImageView.ScaleType;
+
+/**
+ * @author TIS Soichiro Kashima
+ */
+public final class Page1020PhotoIdDocsActivity extends AbstractActivity {
+    /** 次アクティビティクラス。 */
+    private static final Class<? extends Activity> NEXT_ACTIVITY = Page1030Activity.class;
+    /** 名前の要素数(姓・名)。 */
+    private static final int NUM_FIELDS_NAME = 2;
+    /** 名前の要素数(ミドルネームありの場合)。 */
+    private static final int NUM_FIELDS_NAME_WITH_MIDDLE_NAME = 3;
+    /** 日付の要素数(年月日)。 */
+    private static final int NUM_FIELDS_DATE = 3;
+    /** 次画面遷移前に画像を表示する時間(ミリ秒)。 */
+    private static final int IMAGE_SHOWING_PERIOD_MILLISEC = 1500;
+
+    /** カメラ操作用変数。 */
+    private Camera mCamera;
+    /** 免許証認識後、表示する表面撮影画像。 */
+    private Bitmap mPicture;
+    /** 背景に撮影画像を表示しているかどうかを管理するフラグ。 */
+    private boolean mShowingPicture;
+
+    /** 免許証認識非同期タスク。 */
+    private LicenseRecognitionTask mLicenseRecognitionTask;
+    /** 免許証OCR非同期タスク。 */
+    private LicenseOcrTask mLicenseOcrTask;
+    /** 免許証OCR情報加工非同期タスク。 */
+    private LicenseDataEditTask mLicenseDataEditTask;
+
+    /** プレビュー画面イベントのコールバック。 */
+    private SurfaceHolder.Callback mSurfaceListener = new SurfaceHolder.Callback() {
+        public void surfaceCreated(final SurfaceHolder holder) {
+            mCamera = Camera.open();
+            LogUtils.i("TEST", "Surface created");
+            // 画面(Surface)が作成された時にカメラへ一度だけSurfaceを設定する
+            try {
+                mCamera.setPreviewDisplay(holder);
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+
+        public void surfaceDestroyed(final SurfaceHolder holder) {
+            if (mCamera != null) {
+                synchronized (mCamera) {
+                    mCamera.stopPreview();
+                    mCamera.release();
+                    mCamera = null;
+                    LogUtils.i("TEST", "Surface destroyed");
+                }
+            }
+        }
+
+        public void surfaceChanged(final SurfaceHolder holder,
+                final int format, final int width, final int height) {
+            // 電源ボタンによるスリープで画面状態が変わるときにも呼び出されるため
+            // カメラが破棄されていない場合のみパラメータ設定・プレビュー開始を呼び出すようにする
+            if (mCamera != null) {
+                final int pictureMinSize = 1200000;
+                CameraUtils.setParamsWithPictureLargerThan(pictureMinSize, mCamera);
+                CameraUtils.setPreviewArea(mCamera, Page1020PhotoIdDocsActivity.this);
+
+                mCamera.startPreview();
+            }
+        }
+    };
+
+    /** オートフォーカス実行時のコールバック。 */
+    private Camera.AutoFocusCallback mAutoFocusListener = new Camera.AutoFocusCallback() {
+        public void onAutoFocus(final boolean success, final Camera camera) {
+            // Note: 以下をtakePicture()の前に呼び出すと、撮影失敗する。
+            // camera.autoFocus(null);
+
+            // Note: 中身のないCamera.ShutterCallbackは必要(第1引数)。
+            // Android 4.0(2.3からアップデートしたGalaxy S2で確認)では
+            // Camera.ShutterCallbackにnullを指定すると
+            // シャッター音が鳴らなくなってしまうため。
+            MemoryUtils.log("onAutoFocus");
+            camera.takePicture(mShutterListener, null, mPictureListener);
+        }
+    };
+
+    /** シャッター時のコールバック。 */
+    private Camera.ShutterCallback mShutterListener = new Camera.ShutterCallback() {
+        public void onShutter() {
+            // ShutterCallbackを設定しなければシャッター音が鳴らない機種があるため実装する
+        }
+    };
+
+    /** 撮影画像取得時のコールバック。 */
+    private Camera.PictureCallback mPictureListener = new Camera.PictureCallback() {
+        public void onPictureTaken(final byte[] data, final Camera camera) {
+            MemoryUtils.log("onPictureTaken");
+            if (data == null) {
+                setPerformingAction(false);
+                setComponentsEnabled(true);
+            } else {
+                mLicenseRecognitionTask = new LicenseRecognitionTask(
+                        Page1020PhotoIdDocsActivity.this,
+                        getProgressDialogController());
+                mLicenseRecognitionTask.setOnPostExecuteListener(
+                        new LicenseRecognitionTask.OnPostExecuteListener() {
+                            public void onPostExecute(final RecognitionData result,
+                                    final LicenseRecognitionTask.StatusCode statusCode) {
+                                if (result.hasRecognized()) {
+                                    // 縮小した撮影画像で置換
+                                    ((JibunRepository) getApplication()).setJpegLicenseSurface(
+                                            result.imageShrinked);
+                                    result.imageShrinked = null;
+                                    showRecognitionResultAndResumeNext(result);
+                                } else {
+                                    showRecognitionError();
+                                }
+                            }
+                        });
+                mLicenseRecognitionTask.execute(new Jpeg(data));
+            }
+            // 再撮影へ
+            mCamera.startPreview();
+        }
+    };
+
+    /**
+     * 次の画面へ遷移する。
+     */
+    public void startNextActivity() {
+        Intent intent = new Intent();
+        intent.setClass(this, NEXT_ACTIVITY);
+        intent.setAction(Intent.ACTION_VIEW);
+        startActivity(intent);
+        finish();
+    }
+
+    /** 撮影画像を非表示にし、撮影可能な状態にする。 */
+    private void hideImage() {
+        mShowingPicture = false;
+        ((ImageView) findViewById(R.id.surface_iv)).setVisibility(View.GONE);
+        ((ImageView) findViewById(R.id.guide)).setVisibility(View.VISIBLE);
+        ((ImageView) findViewById(R.id.surface_iv3)).setVisibility(View.GONE);
+        setPerformingAction(false);
+        setComponentsEnabled(true);
+    }
+
+    /** 撮影画像を表示する。 */
+    private void showImage() {
+        LogUtils.v("OCR", "Show recognized image.");
+        releasePicture();
+        JibunRepository repository = (JibunRepository) getApplication();
+        byte[] jpegBytes = repository.getJpegLicenseSurface();
+        boolean pictureSet = false;
+        if (jpegBytes != null) {
+            mPicture = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.length);
+            if (mPicture != null && !mPicture.isRecycled()) {
+                ImageView iv = (ImageView) findViewById(R.id.surface_iv);
+                iv.setVisibility(View.VISIBLE);
+                iv.setImageBitmap(mPicture);
+                pictureSet = true;
+            }
+        }
+        if (!pictureSet) {
+            ((ImageView) findViewById(R.id.surface_iv)).setBackgroundColor(Color.WHITE);
+        }
+
+        mShowingPicture = true;
+        showCurrentImage();
+    }
+
+    /** 現在設定されている画像を表示する。 */
+    private void showCurrentImage() {
+        ImageView iv = (ImageView) findViewById(R.id.surface_iv);
+        iv.setVisibility(View.VISIBLE);
+        iv.setScaleType(ScaleType.FIT_CENTER);
+
+        iv = (ImageView) findViewById(R.id.guide);
+        iv.setVisibility(View.GONE);
+        iv = (ImageView) findViewById(R.id.surface_iv3);
+        iv.setVisibility(View.VISIBLE);
+    }
+
+    @Override
+    public void onCreateSelf(final Bundle savedInstanceState) {
+        LogUtils.i("TEST", "Page1020PhotoIdDocsActivity: onCreate");
+        // スリープ防止
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        setContentView(R.layout.page1020_photo);
+
+        // 非表示
+        hideImage();
+    }
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        LogUtils.i("TEST", "Page1020PhotoIdDocsActivity: onStart");
+        MemoryUtils.log("onStart");
+
+        // シャッターボタン
+        View shutter = findViewById(R.id.shutterBtn);
+        shutter.setOnClickListener(new View.OnClickListener() {
+            public void onClick(final View v) {
+                if (isPerformingAction()) {
+                    return;
+                }
+                setPerformingAction(true);
+                Log.i("TEST", "onClick: shutter");
+                v.setEnabled(false);
+                // オートフォーカスして撮影
+                autoFocus();
+            }
+        });
+
+        // 戻るボタン
+        View backBtn = findViewById(R.id.backBtn);
+        backBtn.setOnClickListener(
+                new View.OnClickListener() {
+                    public void onClick(final View v) {
+                        if (isPerformingAction()) {
+                            return;
+                        }
+                        setPerformingAction(true);
+                        Log.i("TEST", "onClick: back");
+                        v.setEnabled(false);
+                        finish();
+                    }
+                });
+
+        // 各種操作を実行可能にする
+        setPerformingAction(false);
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+
+        if (mCamera != null) {
+            mCamera.stopPreview();
+            mCamera.release();
+            mCamera = null;
+        }
+
+        forceCancel();
+
+        LogUtils.i("TEST", "Page1020PhotoIdDocsActivity: onPause");
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        LogUtils.i("TEST", "Page1020PhotoIdDocsActivity: onResume");
+
+        // 背景画像が表示中だった場合は復旧する
+        if (mShowingPicture) {
+            LogUtils.i("TEST", "Page1020PhotoIdDocsActivity: onResume: showing picture");
+            if (mPicture == null || mPicture.isRecycled()) {
+                JibunRepository repository = (JibunRepository) getApplication();
+                byte[] jpegBytes = repository.getJpegLicenseSurface();
+                if (jpegBytes == null) {
+                    // 画像が表示不可の場合(割り込みでクリアされた場合)は画像を外す
+                    ((ImageView) findViewById(R.id.surface_iv)).setBackgroundColor(Color.WHITE);
+                    showCurrentImage();
+                } else {
+                    // 撮影画像のBitmapをリサイクル済みの場合は再度JPEGからBitmapを生成して表示
+                    showImage();
+                }
+            } else {
+                showCurrentImage();
+            }
+        }
+    }
+
+    @Override
+    protected void onPostResume() {
+        super.onPostResume();
+
+        LogUtils.i("TEST", "Page1020PhotoIdDocsActivity: onPostResume: mShowingPicture ? "
+                + mShowingPicture);
+        if (!mShowingPicture) {
+            SurfaceView surface = (SurfaceView) findViewById(R.id.surface);
+            surface.setVisibility(View.VISIBLE);
+            SurfaceHolder holder = surface.getHolder();
+            holder.setType(SurfaceHolder.SURFACE_TYPE_PUSH_BUFFERS);
+            holder.addCallback(mSurfaceListener);
+            LogUtils.i("TEST",
+                    "Page1020PhotoIdDocsActivity: onPostResume: start preview: SurfaceHolder: "
+                            + holder);
+            LogUtils.i("TEST", "Page1020PhotoIdDocsActivity: onPostResume: mCamera: " + mCamera);
+            // Surfaceのカメラへの設定とプレビューの開始はSurfaceHolder.Callbackで行う(ここで行うと競合)
+        }
+    }
+
+    @Override
+    public void onConfigurationChanged(final Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        LogUtils.i("TEST", "Page1020PhotoIdDocsActivity: onConfigurationChanged");
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        releasePicture();
+        LogUtils.i("TEST", "Page1020PhotoIdDocsActivity: onStop");
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (!isPerformingAction()) {
+            setPerformingAction(true);
+            super.onBackPressed();
+        }
+    }
+
+    @Override
+    protected int[] getComponentIds() {
+        return new int[] {
+                R.id.shutterBtn,
+                R.id.backBtn,
+        };
+    }
+
+    @Override
+    protected boolean screenTransitionBefore(final boolean nextFlag) {
+        return true;
+    }
+
+    /**
+     * 確認用ビットマップを解放する。
+     */
+    private void releasePicture() {
+        if (mPicture != null && !mPicture.isRecycled()) {
+            mPicture.recycle();
+            mPicture = null;
+        }
+    }
+
+    /** オートフォーカス・シャッターを実行する。 */
+    private void autoFocus() {
+        new Thread(new Runnable() {
+            public void run() {
+                if (mCamera != null) {
+                    synchronized (mCamera) {
+                        mCamera.autoFocus(mAutoFocusListener);
+                    }
+                }
+            }
+        }).start();
+    }
+
+    /**
+     * 免許証認識成功を通知し、OCR処理を実行する。
+     * 
+     * @param data 認識した免許証のデータ
+     */
+    private void showRecognitionResultAndResumeNext(final RecognitionData data) {
+        // Applicationより情報取得
+        JibunRepository repository = (JibunRepository) getApplication();
+
+        // 再撮影対応
+        if (repository.shouldRetake()) {
+            startNextActivity();
+            return;
+        }
+
+        // 通信圏外処理
+        if (!hasValidConnection()) {
+            showErrorDialog(R.string.common_error_201, false);
+            return;
+        }
+
+        // OCR回数制限対応
+        String ocrLimitStr = repository.getAppConfig(Fields.Config.OCR_LIMIT);
+        int lim;
+        try {
+            lim = Integer.parseInt(ocrLimitStr);
+        } catch (NumberFormatException e) {
+            lim = 0;
+            e.printStackTrace();
+        }
+
+        // カウントアップ
+        repository.increaseOCRCount();
+
+        // 回数制限判定
+        if (lim < repository.getOCRCount()) {
+            // 超過
+
+            // ダイアログ表示後アプリ終了
+            showErrorDialog(R.string.ocr_error_403, true);
+        } else {
+            // 未満
+            showImage();
+
+            mLicenseOcrTask = new LicenseOcrTask(
+                    this,
+                    getProgressDialogController(),
+                    ((JibunRepository) getApplication()).getUUID(),
+                    ((JibunRepository) getApplication()).getAppConfig(Fields.Config.OCR_LINK));
+            mLicenseOcrTask.setOnPostExecuteListener(new LicenseOcrTask.OnPostExecuteListener() {
+                public void onPostExecute(final OcrApiResult result,
+                        final Map<String, OcrException> errors,
+                        final Boolean mCanceled) {
+                    LogUtils.v("OCR", "OCR task finished. canceled: "
+                            + mCanceled + " errors.size(): " + errors.size());
+                    if (mCanceled) {
+                        // 非表示
+                        hideImage();
+                        return;
+                    }
+                    if (errors.size() > 0) {
+                        // showOcrErrors(errors);
+                        for (String key : errors.keySet()) {
+                            OcrException e = errors.get(key);
+                            if (e != null) {
+                                LogUtils.v("OCR", key + ": " + e.getErrorCode().name());
+                                switch (e.getErrorCode()) {
+                                    case FAILED_TO_CONNECT: // サーバ接続エラー
+                                        showErrorDialog(R.string.ocr_error_407,
+                                                false);
+                                        break;
+                                    case CONNECTION_TIMED_OUT: // タイムアウト
+                                        showErrorDialog(R.string.ocr_error_402,
+                                                false);
+                                        break;
+                                    case HTTP_ERROR: // HTTPエラー
+                                    case BAD_SOAP_RESPONSE: // XML形式不正
+                                        showErrorDialog(R.string.common_error_206,
+                                                false);
+                                        break;
+                                    default: // 正常終了以外
+                                        showErrorDialog(R.string.ocr_error_404,
+                                                false);
+                                        break;
+                                }
+                                break;
+                            }
+                        }
+                    } else {
+                        validate(result);
+                    }
+                }
+            });
+            mLicenseOcrTask.execute(data);
+        }
+    }
+
+    /**
+     * エラーアラートを表示する。
+     * 
+     * @author ADS michigami
+     * @param id メッセージのリソースID
+     * @param finishApp 表示後にアプリケーションを終了させる場合はtrue
+     */
+    private void showErrorDialog(final int id, final boolean finishApp) {
+        showDialogFragment(new DialogFragment() {
+            @Override
+            public Dialog onCreateDialog(final Bundle savedInstanceState) {
+                AlertDialog.Builder builder = new AlertDialog.Builder(getActivity());
+                builder.setTitle(R.string.dialog_title_error);
+                builder.setMessage(id);
+                builder.setCancelable(false);
+
+                // OCRError
+                if (finishApp) {
+                    builder.setPositiveButton(R.string.dialog_button_close,
+                            new DialogInterface.OnClickListener() {
+                                public void onClick(final DialogInterface dialog,
+                                        final int which) {
+                                    JibunRepository repository =
+                                            (JibunRepository) Page1020PhotoIdDocsActivity.this
+                                                    .getApplication();
+                                    repository.setEnded(true);
+                                    finish();
+                                }
+                            });
+                    // 通常通信エラー
+                } else {
+                    builder.setPositiveButton(android.R.string.ok,
+                            new DialogInterface.OnClickListener() {
+                                @Override
+                                public void onClick(final DialogInterface dialog, final int which) {
+                                    // 撮影画像表示中なら非表示にして撮影ボタンを有効化
+                                    hideImage();
+                                }
+                            });
+                    builder.setOnCancelListener(
+                            new DialogInterface.OnCancelListener() {
+                                @Override
+                                public void onCancel(final DialogInterface dialog) {
+                                    // 撮影画像表示中なら非表示にして撮影ボタンを有効化
+                                    hideImage();
+                                }
+                            });
+                }
+                Dialog dialog = builder.create();
+                dialog.setCancelable(false);
+                dialog.setCanceledOnTouchOutside(false);
+                return dialog;
+            }
+
+            @Override
+            public void onCancel(final DialogInterface dialog) {
+                super.onCancel(dialog);
+                // 撮影画像表示中なら非表示にして撮影ボタンを有効化
+                hideImage();
+            }
+        });
+    }
+
+    /**
+     * 免許証認識失敗を通知する。
+     */
+    private void showRecognitionError() {
+        showDialogFragment(new DialogFragment() {
+            public Dialog onCreateDialog(final Bundle savedInstanceState) {
+                AlertDialog.Builder builder = new AlertDialog.Builder(getActivity());
+                builder.setTitle(R.string.dialog_title_error);
+                builder.setMessage(R.string.ocr_error_401);
+                builder.setPositiveButton(android.R.string.ok,
+                        new DialogInterface.OnClickListener() {
+                            @Override
+                            public void onClick(final DialogInterface dialog, final int which) {
+                                // ダイアログクローズ時にボタンを有効化
+                                setPerformingAction(false);
+                                setComponentsEnabled(true);
+                            }
+                        });
+                builder.setOnCancelListener(new DialogInterface.OnCancelListener() {
+                    @Override
+                    public void onCancel(final DialogInterface dialog) {
+                        // ダイアログキャンセル時にボタンを有効化
+                        setPerformingAction(false);
+                        setComponentsEnabled(true);
+                    }
+                });
+                Dialog dialog = builder.create();
+                dialog.setCancelable(false);
+                dialog.setCanceledOnTouchOutside(false);
+                return dialog;
+            }
+
+            @Override
+            public void onCancel(final DialogInterface dialog) {
+                super.onCancel(dialog);
+                // ダイアログキャンセル時にボタンを有効化
+                setPerformingAction(false);
+                setComponentsEnabled(true);
+            }
+        });
+    }
+
+    /**
+     * 整合性チェックを実行する。
+     * 
+     * @param result OCR結果
+     */
+    private void validate(final OcrApiResult result) {
+        // APIによる整合性チェックは行わない
+        startLicenseDataEditTask(result);
+    }
+
+    /**
+     * OCR結果を加工する。
+     * 
+     * @param result OCR結果
+     * @author ADS michigami
+     */
+    private void startLicenseDataEditTask(final OcrApiResult result) {
+
+        /** OCR連携 追加　 */
+        mLicenseDataEditTask = new LicenseDataEditTask(
+                this,
+                getProgressDialogController(),
+                ((JibunRepository) getApplication()).getUUID(),
+                ((JibunRepository) getApplication()).getAppConfig(Fields.Config.OCR_LINK));
+        mLicenseDataEditTask.setOnPostExecuteListener(
+                new LicenseDataEditTask.OnPostExecuteListener() {
+                    @Override
+                    public void onPostExecute(final OcrApiResult result,
+                            final Map<String, OcrException> errors, final boolean canceled) {
+                        LogUtils.v("OCR", "Data edit task finished. canceled: "
+                                + canceled + " errors.size(): " + errors.size());
+                        if (canceled) {
+                            hideImage();
+                            return;
+                        }
+
+                        if (errors.size() > 0) {
+                            for (String key : errors.keySet()) {
+                                OcrException e = errors.get(key);
+                                if (e != null) {
+                                    LogUtils.v("OCR", key + ": " + e.getErrorCode().name());
+                                    switch (e.getErrorCode()) {
+                                        case FAILED_TO_CONNECT: // サーバとの接続エラー
+                                            showErrorDialog(R.string.ocr_error_407, false);
+                                            return;
+                                        case CONNECTION_TIMED_OUT: // タイムアウト
+                                            showErrorDialog(R.string.ocr_error_402, false);
+                                            return;
+                                        case HTTP_ERROR: // HTTPエラー
+                                        case BAD_SOAP_RESPONSE: // XML形式不正
+                                            showErrorDialog(R.string.common_error_206, false);
+                                            return;
+                                        default: // 正常終了以外
+                                            // エラーとはみなさない
+                                            break;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+
+                        JibunRepository repository =
+                                (JibunRepository) Page1020PhotoIdDocsActivity.this
+                                        .getApplication();
+                        // OCR結果を一旦クリアしてから設定
+                        repository.clearOcrResult();
+
+                        // 住所・郵便番号は結果をそのまま設定
+                        repository.setOcrResult(Fields.Form.FLD_PERFECTURE, result.getAddress1());
+                        repository.setOcrResult(Fields.Form.FLD_CITY, result.getAddress2());
+                        repository.setOcrResult(Fields.Form.FLD_BLOCK, result.getAddress3());
+                        repository.setOcrResult(Fields.Form.FLD_ZIP_CODE, result.getPostCode());
+
+                        // 氏名
+                        String name = result.getField(OcrField.NAME);
+                        LogUtils.i("TEST", "name : " + name);
+                        if (name != null) {
+                            // 分割できた場合のみ保存
+                            String[] stName = name.split("　");
+                            if (stName.length == NUM_FIELDS_NAME) {
+                                repository
+                                        .setOcrResult(Fields.Form.FLD_KANJI_FIRST_NAME, stName[0]);
+                                repository.setOcrResult(Fields.Form.FLD_KANJI_LAST_NAME, stName[1]);
+                            } else if (stName.length == NUM_FIELDS_NAME_WITH_MIDDLE_NAME) {
+                                repository
+                                        .setOcrResult(Fields.Form.FLD_KANJI_FIRST_NAME, stName[0]);
+                                repository.setOcrResult(Fields.Form.FLD_KANJI_LAST_NAME, stName[1]
+                                        + stName[2]);
+                            }
+                        }
+
+                        // 誕生日
+                        String day = result.getBirthDate();
+                        if (day != null) {
+                            SimpleDateFormat format = new SimpleDateFormat("yyyy/MM/dd");
+                            try {
+                                // 日付形式として変換可能かどうかを確認
+                                if (day.matches("^\\d{4}/\\d{1,2}/\\d{1,2}$")) {
+                                    format.parse(day);
+                                    String[] stDay = day.split("/");
+                                    if (stDay.length == NUM_FIELDS_DATE) {
+                                        repository.setOcrResult(Fields.Form.FLD_YEAR, stDay[0]);
+                                        repository.setOcrResult(Fields.Form.FLD_MONTH, stDay[1]);
+                                        repository.setOcrResult(Fields.Form.FLD_DATE, stDay[2]);
+                                    }
+                                }
+                            } catch (ParseException e) {
+                                // 変換できない形式の場合は無視
+                                LogUtils.v("Page1020PhotoIdDocsActivity",
+                                        "Illegal format birthday: " + day);
+                            }
+                        }
+
+                        // 撮影画像を一定時間表示して次画面へ
+                        new Thread(new Runnable() {
+                            @Override
+                            public void run() {
+                                try {
+                                    // 1秒待つ
+                                    Thread.sleep(IMAGE_SHOWING_PERIOD_MILLISEC);
+                                } catch (InterruptedException e) {
+                                    e.printStackTrace();
+                                }
+                                startNextActivity();
+                            }
+                        }).start();
+                    }
+
+                });
+
+        mLicenseDataEditTask.execute(result);
+    }
+
+    /**
+     * 処理を強制キャンセルし、前画面に戻る。
+     */
+    private void forceCancel() {
+        LogUtils.i("TEST", "forceCancel");
+        // 実行中の非同期タスクがある場合はキャンセルする
+        if (mLicenseRecognitionTask != null) {
+            mLicenseRecognitionTask.cancel(true);
+        }
+        if (mLicenseOcrTask != null) {
+            mLicenseOcrTask.cancel(true);
+        }
+        if (mLicenseDataEditTask != null) {
+            mLicenseDataEditTask.cancel(true);
+        }
+        finish();
+    }
+
+}
